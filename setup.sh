@@ -67,6 +67,7 @@ PKGDIR="/tmp/${PKG}_${VERSION}"
 cd rust-nightly-powerpc64le-unknown-linux-gnu
 ./install.sh --prefix=/root/rust
 export PATH=$PATH:/root/rust/bin
+cp -r "${PKGDIR}/.cargo" ~/
 
 cd "${PKGDIR}/tokenizers/bindings/python"
 pip install setuptools_rust
