@@ -44,12 +44,23 @@ PKG=pytorch
 VERSION=v1.6.0
 PKGDIR="/tmp/${PKG}_${VERSION}"
 
+# get and compile sleef
+git clone https://github.com/shibatch/sleef
+cd sleef
+mkdir build && cd build
+cmake ..
+make
+make DESTDIR=/tmp/sp install
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/tmp/sp/usr/local/lib
+ldconfig -v
+
+# compile torch with pre-compiled sleef
 cd "${PKGDIR}/pytorch"
 
-#python setup.py bdist_wheel
+USE_SYSTEM_SLEEF=ON PKG_CONFIG_PATH=/tmp/sp/usr/local/lib/pkgconfig CPLUS_INCLUDE_PATH=/tmp/sp/usr/local/include LIBRARY_PATH=/tmp/sp/usr/local/lib python setup.py bdist_wheel
 
-USE_MKLDNN=0 USE_CUDNN=0 USE_CUDA=0 python setup.py bdist_wheel
-
+# maybe those flags aren't needed
+#USE_MKLDNN=0 USE_CUDNN=0 USE_CUDA=0 python setup.py bdist_wheel
 
 ### fix dependencies
 
