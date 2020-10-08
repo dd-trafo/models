@@ -1,24 +1,24 @@
+import datetime
+import hashlib
+import os
+import pickle
+import platform
+from typing import List, Union
+
+import cachetools
 import numpy as np
+from pathlib import Path
 import pandas as pd
+import random
+import re
+from sklearn.preprocessing import MultiLabelBinarizer
 from transformers import AdamW, get_linear_schedule_with_warmup
 from transformers import BertTokenizer, BertModel, BertPreTrainedModel
 import torch
 from tqdm import tqdm, trange
-import os
-from sklearn.preprocessing import MultiLabelBinarizer
-import glob
-import ntpath
-import pickle
-import hashlib
-import datetime
-#import re
-#import locale
-#locale.setlocale(locale.LC_ALL, 'en_US.utf8')
-import random
-import re
-from pathlib import Path
 
-#from utils import *
+from sampler import Sampler
+from cacher import Cacher
 
 
 def sanitize_label(label: str) -> str:
@@ -36,9 +36,9 @@ def sanitize_label(label: str) -> str:
     return label
 
 
-def load_sentences(path, clean: bool = True) -> pd.DataFrame:
+def load_sentences(path: str, clean: bool = True) -> pd.DataFrame:
     """
-    Load sentences into a dataframe.
+    Load sentences into a Pandas dataframe.
     - LABELNAME.txt: each line is a sentence assigned to label LABELNAME
     - 12345.json: contains one (1) sentence and its corresponding labels
     """
@@ -47,13 +47,13 @@ def load_sentences(path, clean: bool = True) -> pd.DataFrame:
 
     # Read txt files and extract each line as a sentence
     path = Path(path)
-    files_txt = path.rglob('*.txt')
+    files_txt = list(path.rglob('*.txt'))
 
-    for file in tqdm(files_txt):
-        label = sanitize_label(ntpath.basename(file.with_suffix('')))
+    for file_txt in tqdm(files_txt):
+        label = sanitize_label(file_txt.stem)
 
         sentences = []
-        with open(file, encoding='utf-8') as handle:
+        with open(file_txt, encoding='utf-8') as handle:
             sentences = handle.readlines()
             sentences = [
                 re.sub('[\n\r]', '', sentence) for sentence in sentences
@@ -71,11 +71,10 @@ def load_sentences(path, clean: bool = True) -> pd.DataFrame:
     # Determine duplicates sentences and pick the latest version
     df_json = pd.DataFrame(data={'FILES': files_json})
 
-    df_json['FILES'] = df_json['FILES'].apply(
-        lambda file: ntpath.basename(file))
+    df_json['FILES'] = df_json['FILES'].apply(lambda file: file.name)
 
     df_json[['HASH', 'DATE_TIME']] = df_json.FILES.str.extract(
-        '([a-z0-9]+)_(\d{4}-\d{2}-\d{2}_\d{6}).json')
+        r'([a-z0-9]+)_(\d{4}-\d{2}-\d{2}_\d{6}).json')
 
     df_json = df_json.sort_values(['HASH', 'DATE_TIME'], ascending=False)
 
@@ -85,8 +84,8 @@ def load_sentences(path, clean: bool = True) -> pd.DataFrame:
     files_json = df_json['FILES'].tolist()
 
     series_list = list()
-    for file in tqdm(files_json):
-        series_list.append(pd.read_json(path / file, typ='series'))
+    for file_json in tqdm(files_json):
+        series_list.append(pd.read_json(path / file_json, typ='series'))
 
     df_list.append(pd.DataFrame(series_list))
 
@@ -99,10 +98,9 @@ def load_sentences(path, clean: bool = True) -> pd.DataFrame:
     df['SENTENCE'] = df['SENTENCE'].fillna('')
 
     if clean:
-        from ..cleaner.cleaner import Cleaner
+        from cleaner import Cleaner
         cleaner = Cleaner()
-        df['SENTENCE'] = df['SENTENCE'].apply(
-            lambda sentence: cleaner.clean(sentence))
+        df['SENTENCE'] = df['SENTENCE'].apply(cleaner.clean)
 
         del cleaner
 
@@ -163,16 +161,22 @@ class BertForMultiLabelSequenceClassification(BertPreTrainedModel):
         return outputs  # (loss), logits, (hidden_states), (attentions)
 
 
+# pylint: disable=not-callable
 class SentenceClassifier:
     def __init__(
             self,
             df_train: pd.DataFrame,
             df_eval: pd.DataFrame,
-            batch_size: int,
             neutral_label: str = 'NEUTRAL',
+            device: str = 'cpu',
             path_model:
         str = '/mnt/david_tmp/models/DE/bert-base-german-dbmdz-cased/',
-            path_trained_model: str = '/tmp') -> None:
+            path_trained_model: str = '/tmp',
+            path_cache: str = '/tmp/cache') -> None:
+
+        #self.neutral_label = neutral_label
+
+        self.device = device
 
         self.train_sampler = Sampler(df_train,
                                      neutral_label=neutral_label,
@@ -182,9 +186,7 @@ class SentenceClassifier:
                                     neutral_label=neutral_label,
                                     balance=False)
 
-        # eval_sampler = Sampler(df_eval,
-        #                        neutral_label=neutral_label,
-        #                        balance=False)
+        self.path_trained_model = Path(path_trained_model)
 
         self.labels = self.train_sampler.get_labels()
         self.n_labels = len(self.labels)
@@ -192,32 +194,44 @@ class SentenceClassifier:
         self.label_encoder = MultiLabelBinarizer()
         self.label_encoder.fit([self.labels])
 
-        self.now = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
-
         self.path_model = Path(path_model)
-        self.path_trained_model = Path(path_trained_model) / self.now
+
+        self.now = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        self.path_trained_model = self.path_trained_model / self.now
+
+        #self.model_hash = self.create_random_hash()
+        self.model_hash = 'm123'
+
+        self.cacher = None
+        self.path_cache = path_cache
 
         # Load model
         self.tokenizer = BertTokenizer.from_pretrained(str(self.path_model))
         self.model = BertForMultiLabelSequenceClassification.from_pretrained(
             str(self.path_model), num_labels=self.n_labels)
 
-        self.weight_decay = 0
-        self.warmup_ratio = 0.06
-        self.learning_rate = 4e-5
-        self.adam_epsilon = 1e-8
-        self.device = 'cpu'
-        self.max_grad_norm = 1.0
+    def train(
+        self,
+        n_epoch: int,
+        batch_size: int,
+    ) -> None:
+
+        weight_decay = 0
+        warmup_ratio = 0.06
+        learning_rate = 4e-5
+        adam_epsilon = 1e-8
+        device = 'cpu'
+        max_grad_norm = 1.0
         #save_model_every_epoch = True
 
         no_decay = ['bias', 'LayerNorm.weight']
-        self.optimizer_grouped_parameters = [{
+        optimizer_grouped_parameters = [{
             'params': [
                 p for n, p in self.model.named_parameters()
                 if not any(nd in n for nd in no_decay)
             ],
             'weight_decay':
-            self.weight_decay,
+            weight_decay,
         }, {
             'params': [
                 p for n, p in self.model.named_parameters()
@@ -227,44 +241,37 @@ class SentenceClassifier:
             0.0,
         }]
 
-        self.n_batch = len(df_train) // batch_size
+        n_batch = self.train_sampler.get_n_batch(batch_size)
+        n_batch_eval = self.eval_sampler.get_n_batch(batch_size)
 
-        self.n_batch_eval = len(df_eval) // batch_size
+        t_total = batch_size * n_batch * n_epoch
 
-    def train(self, n_epoch: int):
+        warmup_steps = np.ceil(t_total * warmup_ratio).astype(int)
 
-        t_total = batch_size * self.n_batch * n_epoch
-
-        warmup_steps = int(np.ceil(t_total * self.warmup_ratio))
-
-        optimizer = AdamW(self.optimizer_grouped_parameters,
-                          lr=self.learning_rate,
-                          eps=self.adam_epsilon)
+        optimizer = AdamW(optimizer_grouped_parameters,
+                          lr=learning_rate,
+                          eps=adam_epsilon)
 
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=warmup_steps,
             num_training_steps=t_total)
 
-        torch.cuda.is_available()
-
         # Set model to training mode
         self.model.zero_grad()
         self.model.train()
 
-        #device = 'cpu'
-
         # if device == 'cuda':
         #     self.model.cuda()
-
-        #pbar = trange(n_epoch)
+        #     self.model.to(device)
 
         for i_epoch in range(n_epoch):
 
             loss_train = 0.0
             i_batch = 0
 
-            pbar = tqdm(self.train_sampler.generator(), total=self.n_batch)
+            pbar = tqdm(self.train_sampler.generator(batch_size=batch_size),
+                        total=n_batch)
             for sentences, labels in pbar:
 
                 # Tokenize sentences from train_sampler
@@ -294,7 +301,7 @@ class SentenceClassifier:
 
                 # Clip gradient norm
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                               self.max_grad_norm)
+                                               max_grad_norm)
 
                 #
                 optimizer.step()
@@ -310,8 +317,8 @@ class SentenceClassifier:
             # Put into evaluation mode
             self.model.eval()
             with torch.no_grad():
-                pbar = tqdm(eval_sampler.generator(batch_size=batch_size),
-                            total=self.n_batch_eval)
+                pbar = tqdm(self.eval_sampler.generator(batch_size=batch_size),
+                            total=n_batch_eval)
                 for sentences, labels in pbar:
 
                     # Tokenize sentences from train_sampler
@@ -340,150 +347,189 @@ class SentenceClassifier:
 
                     i_batch = i_batch + 1
 
+            self.save(epoch=i_epoch + 1)
+
             #save()
 
-    def save(self):
-        os.makedirs(self.path_trained_model, exist_ok=True)
-
-        self.model.save_pretrained(self.path_trained_model)
-        self.tokenizer.save_pretrained(self.path_trained_model)
-
-        with open(self.path_trained_model / 'label_encoder.pkl',
-                  'wb') as handle:
-            pickle.dump(label_encoder, handle)
-
-    def predict(self, pred, labels):
-        output = dict()
-        for i, label in enumerate(labels):
-            output[label] = round(float(pred[i]), 3)
-
-        return output
-
-    def logit_to_prob(self, logit):
-        return np.exp(logit) / (np.exp(logit) + 1.0)
-
-    def get_hash(s):
-        return hashlib.sha256(s.encode('utf-8')).hexdigest()
-
-    def save_feedback(path_feedback, sentence, labels):
-        now = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
-
-        df_sentence = pd.DataFrame(data={
-            'SENTENCE': [sentence],
-            'LABELS': [labels]
-        })
-        df_sentence.to_csv(path_feedback + get_hash(sentence) + '_' + now +
-                           '.txt',
-                           index=False)
-
-    def evaluate(self, sentences):
-        n_sentence = len(sentences)
-
-        # Tokenize sentences from train_sampler
-        inputs = self.tokenizer(sentences, padding=True, return_tensors='pt')
-
-        self.model.eval()
-        with torch.no_grad():
-            # Evaluate model
-            outputs = self.model(**inputs)
-
-            #print(outputs)
-
-            preds = outputs[0].sigmoid().detach().cpu().numpy()
-
-        output = list()
-        for i, pred in enumerate(preds):
-            output.append((sentences[i], dict(zip(self.labels, pred))))
-
-        return output
-
-    def get_prediction(pred, labels):
-        output = dict()
-        for i, label in enumerate(labels):
-            output[label] = round(float(pred[i]), 3)
-
-        return output
-
-    def cache_prediction(path_cache, hash_, prediction=None):
+    def save(self, epoch=None) -> None:
         """
-        Caches prediction to disk or returns content existing cache.
+        Save model, tokenizer and label_encoder to disk.
         """
+        output_path = self.path_trained_model
 
-        os.makedirs(path_cache, exist_ok=True)
+        if epoch is not None:
+            output_path = output_path / f'epoch_{epoch}'
 
-        if prediction is None:  # load cache
-            with open(path_cache + hash_ + '.pkl', 'rb') as handle:
-                return pickle.load(handle)
-        else:  # store cache
-            with open(path_cache + hash_ + '.pkl', 'wb') as handle:
-                pickle.dump(prediction, handle)
+        print(f'Saving to: {output_path}... ', end='')
 
-    def evaluate_model_with_cache(sentences, model, tokenizer, label_encoder,
-                                  max_seq_length, device, path_cache):
+        os.makedirs(output_path, exist_ok=True)
 
-        n_sentence = len(sentences)
-        output = [None] * n_sentence
+        self.model.save_pretrained(output_path)
+        self.tokenizer.save_pretrained(output_path)
 
-        pred_indices = list()
-        pred_sentences = list()
-        pred_hashes = list()
+        with open(output_path / 'label_encoder.pkl', 'wb') as handle:
+            pickle.dump(self.label_encoder, handle)
 
-        for i, sentence in enumerate(sentences):
-            hash_ = get_hash(sentence)
-            cache_file = path_cache + hash_ + '.pkl'
+        print('done')
 
-            if os.path.isfile(cache_file):  # load cached prediction
-                output[i] = (sentence, cache_prediction(path_cache, hash_))
-            else:  # predict
-                pred_indices.append(i)
-                pred_sentences.append(sentence)
-                pred_hashes.append(hash_)
+    def get_hash(self, string: str) -> str:
+        return hashlib.sha1(string.encode('utf-8')).hexdigest()
 
-        if len(pred_sentences) > 0:
-            predictions = evaluate_model(pred_sentences, model, tokenizer,
-                                         label_encoder, max_seq_length, device)
+    def create_random_hash(self) -> str:
+        try:
+            hostname = platform.node()
+        except:
+            hostname = 'unknown'
 
-            for i, prediction in enumerate(predictions):
-                index = pred_indices[i]
-                hash_ = pred_hashes[i]
-                sentence = sentences[index]
+        try:
+            username = os.getlogin()
+        except:
+            username = 'unknown'
 
-                # store result
-                cache_prediction(path_cache, hash_, prediction[1])
+        s = hostname + username + str(datetime.datetime.now())
 
-                # put into output
-                output[index] = (sentence, prediction[1])
+        return self.get_hash(s)
 
-        return output
+    # def retrieve_prediction(self, key: str) -> dict:
+    #     with open(self.path_cache / f'{key}.pkl', 'rb') as handle:
+    #         return pickle.load(handle)
 
+    # def store_prediction(self, key: str, prediction: dict) -> None:
+    #     with open(self.path_cache / f'{key}.pkl', 'wb') as handle:
+    #         pickle.dump(prediction, handle)
 
-##################################
-##################################
-##################################
+    def predict(self,
+                sentences: Union[str, List[str]],
+                batch_size: int = 8,
+                use_cache: bool = True,
+                return_list: bool = True):
+
+        if type(sentences) == str:
+            sentences = [sentences]
+
+        if len(sentences) == 0:
+            raise Exception('No sentences supplied.')
+
+        # df_INPUT contains the sentences in their original order
+        df_INPUT = pd.DataFrame({'SENTENCE': sentences})
+        df_INPUT['HASH'] = df_INPUT['SENTENCE'].apply(self.get_hash)
+
+        # Identify unique sentences
+        df_EVAL = df_INPUT.drop_duplicates(subset=['HASH']).reset_index(
+            drop=True)
+
+        if use_cache:
+            # Initialize cacher
+            if self.cacher is None:
+                self.cacher = Cacher(path=self.path_cache,
+                                     model_hash=self.model_hash)
+
+            # Get previously computed labels from cacher
+            # df_CACHED has columns ['HASH', 'LABELS']
+            df_CACHED = self.cacher.get(hashes=df_EVAL['HASH'])
+
+            # Let's determine what still needs to be evaluated
+            # df_EVAL has columns ['SENTENCE', 'HASH', 'LABELS']
+            df_EVAL = df_EVAL[~df_EVAL['HASH'].isin(df_CACHED['HASH'])]
+
+            #df_unique_cached = df_unique.merge(df_cache, how='left', on='HASH')
+
+            #df_unique = df_unique_cached[
+            #    df_unique_cached['LABELS'].isna()].reset_index(drop=True)
+
+        # Initialize column that stores predicted labels
+        df_EVAL['LABELS'] = None
+
+        # Determine number of sentences to evaluate the model with
+        n = len(df_EVAL)
+
+        # Given batch_size, we need to run n_batch iterations
+        n_batch = np.ceil(n / batch_size).astype('int')
+
+        counter = 0
+
+        if n_batch > 0:
+            self.model.eval()
+            with torch.no_grad():
+                for _ in trange(n_batch):
+
+                    # Get indices of batch
+                    batch_idx = df_EVAL.index[counter:(counter + batch_size)]
+
+                    # These are the sentences, List[str]
+                    batch = df_EVAL.loc[batch_idx, 'SENTENCE'].to_list()
+
+                    counter = counter + 1
+
+                    inputs = self.tokenizer(batch,
+                                            padding=True,
+                                            return_tensors='pt')
+
+                    if self.device == 'cuda':
+                        for key in inputs.keys():
+                            inputs[key] = inputs[key].to(self.device)
+
+                    outputs = self.model(**inputs)
+
+                    predictions = outputs[0].sigmoid().detach().cpu().numpy()
+
+                    for i, prediction in enumerate(predictions):
+                        # SQLalchemy cannot JSON-serialize np.float's,
+                        # hence, convert them to Python float
+                        prediction = [value.item() for value in prediction]
+                        prediction_labeled = dict(zip(self.labels, prediction))
+
+                        df_EVAL['LABELS'][batch_idx[i]] = prediction_labeled
+
+                        if use_cache:
+
+                            self.cacher.cache({
+                                'HASH': self.get_hash(batch[i]),
+                                'LABELS': prediction_labeled
+                            })
+
+        df_EVAL = df_EVAL.drop(columns=['SENTENCE'])
+
+        if use_cache:
+            # Add cached predictions from above
+            df_EVAL = pd.concat([df_EVAL, df_CACHED],
+                                axis=0,
+                                ignore_index=True)
+
+        # Finally return the sentences in original order
+        df_INPUT = df_INPUT.merge(df_EVAL, how='left', on='HASH')
+
+        if return_list:
+            return df_INPUT.apply(lambda row: {
+                'SENTENCE': row['SENTENCE'],
+                'LABELS': row['LABELS']
+            },
+                                  axis=1).to_list()
+        else:
+            return df_INPUT
+
+        
 
 if __name__ == "__main__":
 
-    path_sentences = '/opt/python/env_huggingface/sentences/DE/'
-    #path_feedback = path_sentences + 'feedback/'
+    path_sentences = '.../sentences/'
 
     ### load data
-    #df = load_sentences(path_sentences, clean=False)
-
-    #df
-
-    ###############
-    #labels = get_labels(df, exclude='NEUTRAL')
-    #k = len(labels)
+    df = load_sentences(path_sentences, clean=False)
+    df = df.iloc[0:5]
 
     batch_size = 6
+    n_epoch = 1
 
     s = SentenceClassifier(df_train=df,
                            df_eval=df,
-                           batch_size=batch_size,
-                           path_model='/tmp/bert-base-german-dbmdz-cased/')
+                           path_model='.../model_bert/')
 
-    s.train(n_epoch=10)
+    s.train(n_epoch=n_epoch, batch_size=batch_size)
 
-    sentences = ['Ich möchte heiraten.']
+    sentences = [
+        'This is a sentence'
+    ]
 
-    s.evaluate(sentences)
+    s.predict(sentences, batch_size=8)
+    s.predict(sentences, batch_size=8, use_cache=False)
