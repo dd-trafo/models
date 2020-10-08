@@ -65,7 +65,7 @@ class Sampler:
         # strings.ascii_uppercase, the number is limited
         if self._n_labels > len(string.ascii_uppercase):
             raise Exception(
-                f'df contains too many labels ({self.n_labels_w_neutral} > {len(string.ascii_uppercase)})'
+                f'df contains too many labels ({self._n_labels} > {len(string.ascii_uppercase)})'
             )
 
         self.df_labels_encoded = self.df_labels.apply(
@@ -98,11 +98,11 @@ class Sampler:
         print('*** Label Statistic ***')
         print()
         for label in self._labels:
-            n_ = len(self.df_labels[self.df_labels.apply(
+            n = len(self.df_labels[self.df_labels.apply(
                 lambda labels: any(item in label for item in labels))])
 
             print(
-                f'{label:<15s}: {n_:8n} / {self.n:n} ({(n_ / self.n) * 100:6.2f}%)'
+                f'{label:<15s}: {n:8n} / {self._n:n} ({(n / self._n) * 100:6.2f}%)'
             )
 
         print()
@@ -221,7 +221,10 @@ class Sampler:
 
         return indices
 
-    def generator(self, batch_size: int = 8):  # -> Generator[list, list]:
+    def get_n_batch(self, batch_size: int) -> int:
+        return np.ceil(self._n / batch_size).astype(int)
+
+    def generator(self, batch_size: int):  # -> Generator[list, list]:
         """
         Return a fixed-sized (batch_size) list based on _sample_batch_indices().
         """
@@ -299,40 +302,3 @@ class Sampler:
                 batch_labels = self.df_labels.loc[batch_indices].to_list()
 
                 yield batch_sentences, batch_labels
-
-
-if __name__ == "__main__":
-
-    df['P'] = 1  #np.random.randint(low=0, high=3, size=len(df)).astype(float)
-    df.loc[0, 'P'] = 1000
-    df.loc[1, 'P'] = 10
-    #df['P'] = df['P'] / df['P'].sum()
-
-    s = Sampler(df, balance=True, use_weights=True)
-
-    a, b = next(s.generator())
-
-    #s.generate()
-
-    # batch_size = 8
-
-    # for a, b in s.generator(batch_size=batch_size):
-    #     print(a)
-    #     print('-------')
-
-    #sampler.reset()
-
-    # x = list()
-    # for i in trange(1000):
-    #     x.extend(sampler.generate()[1])
-    #     #g.generate()[1]
-
-    # print(pd.Series(x).value_counts())
-
-# pd.Series(x).value_counts()
-
-# list(set(x.split('|')))
-
-# a = pd.concat(x, ignore_index=True)
-
-# a.value_counts()
