@@ -621,8 +621,8 @@ class SentenceClassifier:
                 label: str,
                 min_removal: int = 1,
                 max_removal: int = 3,
-                use_auto_mode: bool = True,
-                use_split: bool = False,
+                n_max: Union[None, int] = 96,
+                test_size: Union[None, float] = 0.3,
                 use_cache: bool = True,
                 n_expand: int = 10):
 
@@ -637,8 +637,8 @@ class SentenceClassifier:
                                   label=label,
                                   min_removal=min_removal,
                                   max_removal=max_removal,
-                                  use_auto_mode=use_auto_mode,
-                                  use_split=use_split,
+                                  n_max=n_max,
+                                  test_size=test_size,
                                   use_cache=use_cache,
                                   n_expand=n_expand)
 
@@ -652,6 +652,7 @@ class SentenceClassifier:
 if __name__ == "__main__":
 
     path_model = '/tmp/bert-base-german-dbmdz-cased/'
+    #path_model = '/tmp/2020-10-11_204853'
     s = SentenceClassifier.from_pretrained(path_model)
 
 if False:
@@ -660,7 +661,7 @@ if False:
     #df = s.load_sentences(path_sentences)
     s.load_data(path_sentences)
 
-    n_epoch = 20
+    n_epoch = 5
     batch_size = 8
     s.train(n_epoch=n_epoch, batch_size=batch_size)
 
@@ -670,9 +671,22 @@ if False:
 
     s.labels
 
-    s.explain('This is a sentence.',
-              label='ENVIRONMENT',
-              use_auto_mode=True,
+    s.explain('Es geht um eine grosse Familie.',
+              label='FAMILY',
+              n_max=None,
+              test_size=0.3,
+              use_cache=True)
+
+    s.explain('Es geht um eine grosse Familie.',
+              label='FAMILY',
+              n_max=None,
+              test_size=None,
+              use_cache=True)
+
+    s.explain('Es geht um eine grosse Familie.',
+              label='FAMILY',
+              n_max=20,
+              test_size=0.1,
               use_cache=True)
 
     s.save()
