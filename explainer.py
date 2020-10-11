@@ -134,8 +134,8 @@ class Explainer:
                 label: str,
                 min_removal: int = 1,
                 max_removal: int = 3,
-                use_auto_mode: bool = True,
-                use_split: bool = False,
+                n_max: Union[None, int] = 96,
+                test_size: Union[None, float] = 0.3,
                 use_cache: bool = True,
                 n_expand: int = 10):
         """
@@ -151,6 +151,9 @@ class Explainer:
         assert min_removal <= max_removal, '`min_removal` must be less or equal `max_removal`.'
         assert n_expand >= 1, '`n_repeat` must be greater or equal 1.'
         assert label is not None, '`label` must be supplied.'
+        assert (n_max is None) or (
+            n_max >
+            0), f'`n_max` ({n_max}) must either be None of greater zero.'
 
         # Tokenize `txt`
         tokens = tokenizer.encode(txt, add_special_tokens=False)
@@ -169,24 +172,21 @@ class Explainer:
         # We received this many variations
         n_samples = len(tokens_list)
 
-        if not use_auto_mode:
+        if n_max is None:
             print(f'INFO: Evaluating {n_samples} samples.')
 
-        # In auto mode, we evaluate at minimum N_MAX samples
-        BATCH_SIZE = 8
-        N_MAX = 12 * BATCH_SIZE
-
-        if use_auto_mode and (N_MAX < n_samples):
-            # Shuffle generated samples
+        if (n_max is not None) and (n_max < n_samples):
+            # Evaluate `n_max` out of `n_samples` samples. First, shuffle
+            # generated samples to get a more diverse selection.
             tokens_list, X, sims = shuffle(tokens_list,
                                            X,
                                            sims,
                                            random_state=42)
 
-            # Translate the first `N_MAX` samples into strings
+            # Translate the first `n_max` samples into strings
             txts_ = [
                 self._remove_prefix(tokenizer.decode(tokens_))
-                for tokens_ in tokens_list[0:N_MAX]
+                for tokens_ in tokens_list[0:n_max]
             ]
 
             # Evaluate `N_MAX` strings by supplied predictor
@@ -195,51 +195,12 @@ class Explainer:
             # Extract the given label from the prediction
             y = np.array([pred['LABELS'][label] for pred in preds])
 
-            # Check if we observed 2 classes from the black-box model
-            if len(np.unique(y > 0.5)) == 2:
-                X = X[0:N_MAX]
-                sims = sims[0:N_MAX]
-            else:
-                # We only observe a single class, let's evaluate more samples
-                # and check again
-                print('Observed only 1 class. Evaluating more samples...')
-
-                # Each step adds these many samples
-                STEP_SIZE = 4 * BATCH_SIZE
-
-                # Based on `STEP_SIZE`, determine how many chunks of `txts`
-                # there are
-                steps = np.ceil((n_samples - N_MAX) / STEP_SIZE).astype(int)
-
-                # We already evaluated `N_MAX` samples, hence, this is our
-                # starting point
-                counter = N_MAX
-
-                # Evaluate more samples
-                for _ in range(steps):
-                    # Translate the next set of samples into strings
-                    txts_ = [
-                        self._remove_prefix(tokenizer.decode(tokens_))
-                        for tokens_ in tokens_list[counter:(counter +
-                                                            STEP_SIZE)]
-                    ]
-
-                    # Evaluate the strings
-                    preds = predict(txts_, use_cache=use_cache)
-                    y_ = np.array([pred['LABELS'][label] for pred in preds])
-                    y = np.concatenate([y, y_])
-
-                    counter = counter + STEP_SIZE
-
-                    if len(np.unique(y > 0.5)) == 2:
-                        # We're done, there are now 2 classes
-                        break
-
-                X = X[0:counter]
-                sims = sims[0:counter]
+            # Slice X and sims accordingly
+            X = X[0:n_max]
+            sims = sims[0:n_max]
         else:
-            # Evaluate all generated samples, hence translate all token variations
-            # into strings
+            # Evaluate all generated samples. First, translate all token
+            # variations into strings
             txts = [
                 self._remove_prefix(tokenizer.decode(tokens_))
                 for tokens_ in tokens_list
@@ -252,28 +213,24 @@ class Explainer:
         assert X.shape[0] == y.shape[0] == sims.shape[
             0], f'Dimension 0 of X ({X.shape[0]}), y ({y.shape[0]}) and sims ({sims.shape[0]}) do not match.'
 
-        # We need to have predictions for each of 2 classes
-        assert len(
-            np.unique(y > 0.5)
-        ) > 1, 'Black-box model only predicted a single class for all derived samples, sentence cannot be explained.'
-
-        if use_split:
-            # Split X, y and sims into train and test sets
-            X_train, X_test, y_train, y_test, sims_train, sims_test = train_test_split(
-                X,
-                y,
-                sims,
-                test_size=0.3,
-                stratify=(y > 0.5).astype(int),
-                random_state=42)
-        else:
+        if test_size is None:
             X_train = X
             y_train = y
             sims_train = sims
+        else:
+            # Split X, y and sims into train and test sets
+            X_train, X_test, y_train, y_test, sims_train, sims_test = train_test_split(
+                X, y, sims, test_size=test_size, random_state=42)
 
-        # SDGClassifier requires binary y_train, hence, expand
+        # SDGClassifier requires binary y_train, thus, transform X_train,
+        # y_train and sims_train
         X_train_expanded, y_train_expanded, sims_train_expanded = self.expand(
             X_train, y_train, sims_train, n_expand=n_expand)
+
+        # We need to have predictions for each of 2 classes
+        assert len(
+            np.unique(y_train)
+        ) > 1, 'Black-box model only predicted a single class for all derived samples, consider increasing `n_max`.'
 
         # Create white-box model (logistic regression)
         clf = SGDClassifier(loss='log',
@@ -288,7 +245,10 @@ class Explainer:
 
         weights = dict(zip(words, clf.coef_[0]))
 
-        if use_split:
+        if test_size is None:
+            kld = None
+            score = None
+        else:
             # Predict test set
             y_test_pred = clf.predict_proba(X_test)
 
@@ -302,9 +262,6 @@ class Explainer:
             score = clf.score(X_test,
                               y_test_.argmax(axis=1),
                               sample_weight=sims_test)
-        else:
-            kld = None
-            score = None
 
         return {
             'weights': weights,
