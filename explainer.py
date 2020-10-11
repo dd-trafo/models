@@ -189,7 +189,7 @@ class Explainer:
                 for tokens_ in tokens_list[0:n_max]
             ]
 
-            # Evaluate `N_MAX` strings by supplied predictor
+            # Evaluate `n_max` strings by supplied predictor
             preds = predict(txts_, use_cache=use_cache)
 
             # Extract the given label from the prediction
