@@ -19,6 +19,7 @@ class Prediction(Base):
 
     __tablename__ = 'cache'
 
+    # Define columns in table `cache`.
     HASH = Column(String, primary_key=True)
     LABELS = Column(JSON)
 
@@ -28,7 +29,11 @@ class Prediction(Base):
 
 # pylint: disable=maybe-no-member
 class Cacher:
-    def __init__(self, path: str, model_hash: str) -> None:
+    """
+    Cacher initializes a sqlite3 database to store and retrieve predictions.
+    :param: path: Determines directory where `cache.db` is created.
+    """
+    def __init__(self, path: str) -> None:
 
         # The db will be stored in folder 'path'
         self.path = Path(path)
@@ -36,42 +41,51 @@ class Cacher:
         # Create folder if it does not exist
         os.makedirs(self.path, exist_ok=True)
 
-        # 'model_hash' determines the db filename inside 'path'
-        self.model_hash = model_hash
-        self.db_file = self.path / f'{self.model_hash}.db'
-
+        # Create engine
+        self.db_file = self.path / 'cache.db'
         self.engine = create_engine(f'sqlite:///{self.db_file}', echo=False)
 
         # Create session
-        Session = sessionmaker(bind=self.engine)
-        self.session = Session()
+        self.session = sessionmaker(bind=self.engine)()
 
         # Create table if it does not exist
         if not self.engine.dialect.has_table(self.engine, 'cache'):
             Base.metadata.create_all(self.engine)
 
-    def get(self, hashes: Union[str, List[str]]) -> pd.DataFrame:
+    def get(self, HASHES: Union[str, List[str]]) -> pd.DataFrame:
         """
-        Get cached predictions from sqlite db.
+        Get cached predictions from db
+        :param: HASHES: List of strings to be queried from db column `HASH`
         """
 
-        if type(hashes) == str:
-            hashes = [hashes]
+        if type(HASHES) == str:
+            HASHES = [HASHES]
 
-        sql = self.session.query(Prediction).filter(
-            Prediction.HASH.in_(hashes)).statement
+        try:
+            sql = self.session.query(Prediction).filter(
+                Prediction.HASH.in_(HASHES)).statement
 
-        return pd.read_sql(sql, self.session.bind)
+            df = pd.read_sql(sql, self.session.bind)
+        except Exception as e:
+            # This happens e.g. if the database file is removed
+            print(f'Error: {str(e)}. Re-initializing database.')
+            self.__init__(self.path)
+            df = pd.DataFrame(columns=['HASH', 'LABELS'])
 
-    def cache(self, predictions: Union[dict, List[dict]]) -> None:
+        return df
+
+    def set(self, HASH: str, LABELS: dict) -> None:
         """
-        Persist predictions to db.
+        Persist a prediction to db
+        :param: HASH: A string to be used as key to store the value (i.e. `LABELS`).
+                      If `HASH` already exists, supplied `LABELS` will overwrite
+                      its previous entry.
+        :param: LABELS: A dictionary containing predictions, must not contain
+                        np.floats in order to be JSON serializable.
         """
-        if type(predictions) == dict:
-            predictions = [predictions]
 
-        for pred in predictions:
-            self.session.merge(
-                Prediction(HASH=pred['HASH'], LABELS=pred['LABELS']))
-
+        self.session.merge(Prediction(HASH=HASH, LABELS=LABELS))
         self.session.commit()
+
+    def close(self):
+        self.session.close()
