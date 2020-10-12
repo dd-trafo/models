@@ -12,14 +12,17 @@ import time
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer
 from sklearn.model_selection import train_test_split
 from transformers import AdamW, get_linear_schedule_with_warmup
-from transformers import BertTokenizer, BertModel, BertPreTrainedModel
+from transformers import BertTokenizer, BertModel, BertPreTrainedModel, BertForSequenceClassification
+from transformers.modeling_outputs import SequenceClassifierOutput
 import torch
+from torch.nn import BCEWithLogitsLoss
 from tqdm import tqdm, trange
 
 from sampler import Sampler
+from cleaner import Cleaner
 from cacher import Cacher
 from explainer import Explainer
 
@@ -61,7 +64,11 @@ class BertForMultiLabelSequenceClassification(BertPreTrainedModel):
         head_mask=None,
         inputs_embeds=None,
         labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
     ):
+
         outputs = self.bert(
             input_ids,
             attention_mask=attention_mask,
@@ -69,6 +76,9 @@ class BertForMultiLabelSequenceClassification(BertPreTrainedModel):
             position_ids=position_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
         )
 
         pooled_output = outputs[1]
@@ -76,30 +86,40 @@ class BertForMultiLabelSequenceClassification(BertPreTrainedModel):
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
 
-        outputs = (logits, ) + outputs[
-            2:]  # add hidden states and attention if they are here
-
+        loss = None
         if labels is not None:
-            loss_fct = torch.nn.BCEWithLogitsLoss()
+            loss_fct = BCEWithLogitsLoss()
             labels = labels.float()
             loss = loss_fct(logits.view(-1, self.num_labels),
                             labels.view(-1, self.num_labels))
-            outputs = (loss, ) + outputs
 
-        return outputs  # (loss), logits, (hidden_states), (attentions)
+        if not return_dict:
+            output = (logits, ) + outputs[2:]
+            return ((loss, ) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
 
 
 # pylint: disable=not-callable
 class SentenceClassifier:
-    def __init__(self,
-                 path_model: str,
-                 path_output: str = tempfile.gettempdir(),
-                 device: Union[None, str] = None) -> None:
+    def __init__(
+        self,
+        path_model: str,
+        path_output: str = tempfile.gettempdir(),
+        exclusive_classes: bool = False,
+        device: Union[None, str] = None,
+    ) -> None:
 
         self.path_model = Path(path_model)
         self.path_output = Path(path_output)
         self.now = datetime.datetime.now().strftime('%Y-%m-%d_%H%M%S')
         self.path_output = self.path_output / self.now
+        self.exclusive_classes = exclusive_classes
 
         self.train_sampler = None
         self.eval_sampler = None
@@ -119,6 +139,17 @@ class SentenceClassifier:
                 with open(self.path_model / 'label_encoder.pkl',
                           'rb') as handle:
                     self.label_encoder = pickle.load(handle)
+
+            # Check which type of encoder we have. This determines if classes
+            # are exclusive or not
+            if type(self.label_encoder) == LabelEncoder:
+                self.exclusive_classes = True
+            elif type(self.label_encoder) == MultiLabelBinarizer:
+                self.exclusive_classes = False
+            else:
+                raise Exception(
+                    f'Cannot handle type of `label_encoder`: {type(self.label_encoder)}'
+                )
 
             # Load neutral label
             with Timer('Loading neutral label'):
@@ -144,22 +175,25 @@ class SentenceClassifier:
                 raise FileNotFoundError('Could not find `pytorch_model.bin`.')
 
             # We found a vanilla model. Don't load anything just yet, since we need to know
-            # `n_labels` from load_data().
+            # the number of labels from `load_data()``.
             print('Found vanilla model. Call `load_data(...)` to initialize.')
             self.neutral_label = None
             self.tokenizer = None
             self.model = None
 
     @classmethod
-    def from_pretrained(cls, path):
-        return SentenceClassifier(path)
+    def from_pretrained(cls, *args, **kwargs):
+        return SentenceClassifier(*args, **kwargs)
 
-    def load_data(self,
-                  path: Union[None, str] = None,
-                  df: Union[None, pd.DataFrame] = None,
-                  df_eval: Union[None, pd.DataFrame] = None,
-                  test_size: float = 0.3,
-                  neutral_label: str = 'NEUTRAL') -> None:
+    def load_data(
+        self,
+        path: Union[None, str] = None,
+        df: Union[None, pd.DataFrame] = None,
+        df_eval: Union[None, pd.DataFrame] = None,
+        test_size: Union[None, float] = None,
+        neutral_label: str = 'NEUTRAL',
+        clean: bool = True,
+    ) -> None:
 
         if (path is None) and (df is None):
             raise Exception('Supply either `path` or `df`.')
@@ -167,11 +201,33 @@ class SentenceClassifier:
         if (path is not None) and (df is not None):
             print('`df` is ignored if both `path` and `df` are supplied.')
 
+        if (df is not None) and (df_eval is not None) and (test_size
+                                                           is not None):
+            print(
+                '`test_size` is ignored if both `df` and `df_eval` are supplied.'
+            )
+
+        if df is not None:
+            assert 'SENTENCE' in df.columns, '`df` must have column `SENTENCE`'
+            assert 'LABELS' in df.columns, '`df` must have column `LABELS`'
+
         if path is not None:
             with Timer('Loading sentences'):
-                df = self.load_sentences(path)
+                df = self.load_sentences(path, clean=clean)
+
+        if self.exclusive_classes and df['LABELS'].str.contains(
+                '|', regex=False).any():
+            print('Conflicting sample(s):')
+            print('----------------------')
+            print(df[df['LABELS'].str.contains('|', regex=False)].head())
+            raise Exception(
+                'Option `exclusive_classes=True` requires one label per sentence.'
+            )
 
         if df_eval is None:
+            if test_size is None:
+                test_size = 0.3
+
             with Timer('Splitting into train and eval sets'):
                 df_train, df_eval = train_test_split(df, test_size=test_size)
         else:
@@ -193,7 +249,8 @@ class SentenceClassifier:
                                         neutral_label=neutral_label,
                                         balance=False)
 
-        # If fine-tuned model has not been loaded
+        # If fine-tuned model has not been loaded, the user requested a
+        # vanilla model
         if self.model is None:
             self.labels = self.train_sampler.get_labels()
             self.n_labels = len(self.labels)
@@ -201,15 +258,28 @@ class SentenceClassifier:
 
             # Initialize label encoder
             with Timer('Initializing label encoder'):
-                self.label_encoder = MultiLabelBinarizer()
-                self.label_encoder.fit([self.labels])
+                if self.exclusive_classes:
+                    self.label_encoder = LabelEncoder()
+                    # `LabelEncoder` must be fitted with `neutral_label`.
+                    # Careful, it assigns numbers in alphabetic order!
+                    self.label_encoder.fit([self.neutral_label] + self.labels)
+                else:
+                    # `MultiLabelBinarizer` outputs zeros for unknown labels
+                    self.label_encoder = MultiLabelBinarizer()
+                    self.label_encoder.fit([self.labels])
 
             # Load model
             with Timer('Loading model'):
                 self.tokenizer = BertTokenizer.from_pretrained(
                     str(self.path_model))
-                self.model = BertForMultiLabelSequenceClassification.from_pretrained(
-                    str(self.path_model), num_labels=self.n_labels)
+
+                if self.exclusive_classes:
+                    # We add one to `num_labels` to account for `neutral_label`
+                    self.model = BertForSequenceClassification.from_pretrained(
+                        str(self.path_model), num_labels=self.n_labels + 1)
+                else:
+                    self.model = BertForMultiLabelSequenceClassification.from_pretrained(
+                        str(self.path_model), num_labels=self.n_labels)
 
     def _sanitize_label(self, label: str) -> str:
         """
@@ -296,7 +366,6 @@ class SentenceClassifier:
         df['SENTENCE'] = df['SENTENCE'].fillna('')
 
         if clean:
-            from cleaner import Cleaner
             cleaner = Cleaner()
             df['SENTENCE'] = df['SENTENCE'].apply(cleaner.clean)
 
@@ -306,10 +375,12 @@ class SentenceClassifier:
 
         return df
 
-    def train(self,
-              n_epoch: int,
-              batch_size: int,
-              device: Union[None, str] = None) -> None:
+    def train(
+        self,
+        n_epoch: int,
+        batch_size: int,
+        device: Union[None, str] = None,
+    ) -> None:
 
         if (self.train_sampler is None) or (self.eval_sampler is None):
             raise Exception('No data found (did you call `load_data(...)`?)')
@@ -320,7 +391,7 @@ class SentenceClassifier:
         # When modifying the model weights, invalidate the cacher and point to
         # a temp directory
         self.path_model = Path(
-            tempfile.gettempdir()) / f'cacher_{s.create_random_hash()}'
+            tempfile.gettempdir()) / f'cacher_{self.create_random_hash()}'
         self.cacher = None
 
         # parameters
@@ -349,6 +420,7 @@ class SentenceClassifier:
             0.0,
         }]
 
+        # Query number of batches from samples
         n_batch = self.train_sampler.get_n_batch(batch_size)
         n_batch_eval = self.eval_sampler.get_n_batch(batch_size)
 
@@ -377,7 +449,6 @@ class SentenceClassifier:
 
             loss_train = 0.0
             i_batch = 0
-
             with tqdm(self.train_sampler.generator(batch_size=batch_size),
                       total=n_batch) as pbar:
 
@@ -388,10 +459,17 @@ class SentenceClassifier:
                                             padding=True,
                                             return_tensors='pt')
 
-                    # Add one-hot-encoded labels as tensor
-                    inputs['labels'] = torch.tensor(
-                        self.label_encoder.transform(
-                            [tuple(x) for x in labels]))
+                    # Add labels to `inputs`
+                    if self.exclusive_classes:
+                        # Flatten list of lists for `LabelEncoder`
+                        labels = [label[0] for label in labels]
+
+                        inputs['labels'] = torch.tensor(
+                            self.label_encoder.transform(labels))
+                    else:
+                        inputs['labels'] = torch.tensor(
+                            self.label_encoder.transform(
+                                [tuple(label) for label in labels]))
 
                     # Forward pass
                     outputs = self.model(**inputs)
@@ -403,7 +481,7 @@ class SentenceClassifier:
                     average_loss = loss_train / (i_batch + 1)
 
                     pbar.set_description(
-                        f'Epoch {i_epoch + 1}, train: {current_loss:.5f} (avg: {average_loss:.5f})'
+                        f'Epoch {i_epoch}, train: {current_loss:.5f} (avg: {average_loss:.5f})'
                     )
 
                     # Backpropagation of loss
@@ -436,10 +514,17 @@ class SentenceClassifier:
                                             padding=True,
                                             return_tensors='pt')
 
-                    # Add one-hot-encoded labels as tensor
-                    inputs['labels'] = torch.tensor(
-                        self.label_encoder.transform(
-                            [tuple(x) for x in labels]))
+                    # Add labels to `inputs`
+                    if self.exclusive_classes:
+                        # Flatten list of lists for `LabelEncoder`
+                        labels = [label[0] for label in labels]
+
+                        inputs['labels'] = torch.tensor(
+                            self.label_encoder.transform(labels))
+                    else:
+                        inputs['labels'] = torch.tensor(
+                            self.label_encoder.transform(
+                                [tuple(x) for x in labels]))
 
                     outputs = self.model(**inputs)
 
@@ -450,7 +535,7 @@ class SentenceClassifier:
                     average_loss = loss_eval / (i_batch + 1)
 
                     pbar.set_description(
-                        f'{len(f"Epoch {i_epoch + 1},") * " "} eval:  {loss_eval:.5f} (avg: {average_loss:.5f})'
+                        f'{len(f"Epoch {i_epoch},") * " "} eval:  {loss_eval:.5f} (avg: {average_loss:.5f})'
                     )
 
                     i_batch = i_batch + 1
@@ -461,6 +546,9 @@ class SentenceClassifier:
         """
         Save model, tokenizer and label_encoder to disk.
         """
+
+        if (self.model is None) or (self.tokenizer is None):
+            raise Exception('No model loaded. Did you call `load_data(...)`?')
 
         if path is None:
             path = self.path_output
@@ -504,35 +592,35 @@ class SentenceClassifier:
 
         return self.get_hash(s)
 
-    # def retrieve_prediction(self, key: str) -> dict:
-    #     with open(self.path_cache / f'{key}.pkl', 'rb') as handle:
-    #         return pickle.load(handle)
+    def predict(
+        self,
+        txt: Union[str, List[str]],
+        batch_size: int = 8,
+        use_cache: bool = True,
+        return_dataframe: bool = False,
+        device: Union[None, str] = None,
+    ):
 
-    # def store_prediction(self, key: str, prediction: dict) -> None:
-    #     with open(self.path_cache / f'{key}.pkl', 'wb') as handle:
-    #         pickle.dump(prediction, handle)
+        if (self.model is None) or (self.tokenizer is None):
+            raise Exception('No model loaded. Did you call `load_data(...)`?')
 
-    def predict(self,
-                sentences: Union[str, List[str]],
-                batch_size: int = 8,
-                use_cache: bool = True,
-                return_list: bool = True,
-                device: Union[None, str] = None):
-
-        if type(sentences) == str:
-            sentences = [sentences]
-
-        if len(sentences) == 0:
-            raise Exception('No sentences supplied.')
+        if type(txt) == list:
+            return_list = True
+        else:
+            return_list = False
+            txt = [txt]
 
         if device is not None:
             self.device = device
 
-        # df_INPUT stores sentences in their original order
-        df_INPUT = pd.DataFrame({'SENTENCE': sentences})
+        assert len(txt) > 0, 'No txt supplied.'
+        assert batch_size > 0, '`batch_size` must be a positive integer.'
+
+        # df_INPUT stores txts in their original order
+        df_INPUT = pd.DataFrame({'SENTENCE': txt})
         df_INPUT['HASH'] = df_INPUT['SENTENCE'].apply(self.get_hash)
 
-        # Identify unique sentences
+        # Identify unique txts
         df_EVAL = df_INPUT.drop_duplicates(subset=['HASH']).reset_index(
             drop=True)
 
@@ -552,7 +640,7 @@ class SentenceClassifier:
         # Initialize column that stores predicted labels
         df_EVAL['LABELS'] = None
 
-        # Determine number of sentences to evaluate the model with
+        # Determine number of txts to evaluate the model with
         n = len(df_EVAL)
 
         # Given batch_size, we need to run n_batch iterations
@@ -567,7 +655,7 @@ class SentenceClassifier:
                     # Get indices of batch
                     batch_idx = df_EVAL.index[counter:(counter + batch_size)]
 
-                    # These are the sentences to be evaluated, List[str]
+                    # These are the txts to be evaluated, List[str]
                     batch = df_EVAL.loc[batch_idx, 'SENTENCE'].to_list()
 
                     counter = counter + batch_size
@@ -582,13 +670,29 @@ class SentenceClassifier:
 
                     outputs = self.model(**inputs)
 
-                    predictions = outputs[0].sigmoid().detach().cpu().numpy()
+                    if self.exclusive_classes:
+                        # Exclusive classes requires normalization via softmax,
+                        # s.t. it sums to one
+                        predictions = outputs[0].softmax(
+                            dim=1).detach().cpu().numpy()
+                    else:
+                        # For multi-label problems, each predicted dimension is
+                        # independent, hence, requires sigmoid
+                        predictions = outputs[0].sigmoid().detach().cpu(
+                        ).numpy()
 
                     for i, prediction in enumerate(predictions):
                         # SQLalchemy cannot JSON-serialize np.float's,
                         # hence, convert them to Python float
                         prediction = [value.item() for value in prediction]
-                        prediction_labeled = dict(zip(self.labels, prediction))
+
+                        if self.exclusive_classes:
+                            # Zip predictions with label_encoder's classes
+                            prediction_labeled = dict(
+                                zip(self.label_encoder.classes_, prediction))
+                        else:
+                            prediction_labeled = dict(
+                                zip(self.labels, prediction))
 
                         df_EVAL['LABELS'][batch_idx[i]] = prediction_labeled
 
@@ -604,27 +708,37 @@ class SentenceClassifier:
                                 axis=0,
                                 ignore_index=True)
 
-        # Finally return the sentences in original order
+        # Finally return the txts in original order
         df_INPUT = df_INPUT.merge(df_EVAL, how='left', on='HASH')
 
-        if return_list:
-            return df_INPUT.apply(lambda row: {
+        if return_dataframe:
+            return df_INPUT
+        else:
+            output = df_INPUT.apply(lambda row: {
                 'SENTENCE': row['SENTENCE'],
                 'LABELS': row['LABELS']
             },
-                                  axis=1).to_list()
-        else:
-            return df_INPUT
+                                    axis=1).to_list()
 
-    def explain(self,
-                txt: str,
-                label: str,
-                min_removal: int = 1,
-                max_removal: int = 3,
-                n_max: Union[None, int] = 96,
-                test_size: Union[None, float] = 0.3,
-                use_cache: bool = True,
-                n_expand: int = 10):
+            if return_list:
+                return output
+            else:
+                return output[0]
+
+    def explain(
+        self,
+        txt: str,
+        label: str,
+        min_removal: int = 1,
+        max_removal: int = 3,
+        n_max: Union[None, int] = 96,
+        test_size: Union[None, float] = 0.3,
+        use_cache: bool = True,
+        n_expand: int = 10,
+    ):
+
+        if (self.model is None) or (self.tokenizer is None):
+            raise Exception('No model loaded. Did you call `load_data(...)`?')
 
         if label not in self.labels:
             raise Exception(
@@ -644,51 +758,133 @@ class SentenceClassifier:
 
         return explanation
 
+    def get_embedding(
+        self,
+        txt: Union[str, List[str]],
+        batch_size: int = 8,
+        device: Union[None, str] = None,
+    ) -> Union[np.array, List[np.array]]:
+        """
+        Get model-internal representation of a supplied txt,
+        i.e. its [CLS] embedding
+        """
+
+        if (self.model is None) or (self.tokenizer is None):
+            raise Exception('No model loaded. Did you call `load_data(...)`?')
+
+        if type(txt) == list:
+            return_list = True
+        else:
+            return_list = False
+            txt = [txt]
+
+        if device is not None:
+            self.device = device
+
+        assert batch_size > 0, '`batch_size` must be a positive integer.'
+
+        # Determine number of elements to evaluate the model with
+        n = len(txt)
+
+        # Given batch_size, we need to run n_batch iterations
+        n_batch = np.ceil(n / batch_size).astype(int)
+
+        cls_embeddings = list()
+        if n_batch > 0:
+            self.model.eval()
+            with torch.no_grad():
+                counter = 0
+                for _ in trange(n_batch):
+                    # Select a batch of strings
+                    batch = txt[counter:(counter + batch_size)]
+                    counter = counter + batch_size
+
+                    # Tokenize
+                    inputs = self.tokenizer(batch,
+                                            padding=True,
+                                            return_tensors='pt')
+
+                    # Forward pass of inputs to receive embeddings
+                    outputs = self.model.forward(
+                        **inputs,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+
+                    # Pick from outputs:
+                    # -1 -> the last layer
+                    #  : -> all txts
+                    #  0 -> [CLS] token
+                    #  : -> all dimensions
+                    embeddings = outputs.hidden_states[-1][:, 0, :].numpy()
+
+                    # For all supplied txts
+                    for i in range(embeddings.shape[0]):
+                        cls_embeddings.append(embeddings[i])
+
+        if return_list:
+            # User supplied a list, hence, also return a list
+            return cls_embeddings
+        else:
+            # User supplied a string, hence, return a single element
+            return cls_embeddings[0]
+
 
 ##################################
 ##################################
 ##################################
 
-if __name__ == "__main__":
+if __name__ == '__main__':
 
     path_model = '/tmp/bert-base-german-dbmdz-cased/'
     #path_model = '/tmp/2020-10-11_204853'
-    s = SentenceClassifier.from_pretrained(path_model)
-
-if False:
+    model = SentenceClassifier.from_pretrained(path_model,
+                                               exclusive_classes=True)
 
     path_sentences = '/opt/python/env_huggingface/sentences/DE/'
-    #df = s.load_sentences(path_sentences)
-    s.load_data(path_sentences)
+    df = model.load_sentences(path_sentences, clean=True)
 
-    n_epoch = 5
+    #model.load_data(path_sentences)
+    model.load_data(df=df, df_eval=df)
+if False:
+
+    n_epoch = 10
     batch_size = 8
-    s.train(n_epoch=n_epoch, batch_size=batch_size)
+    model.train(n_epoch=n_epoch, batch_size=batch_size)
 
-    txt = 'Es geht um die Familie.'
+    #txt = 'Es geht um eine grosse Familie.'
+    txt = 'Der Hochzeitstag steht bevor.'
 
-    s.predict([txt, txt], use_cache=True)
+    x = model.get_embedding(txt)
+    x.shape
 
-    s.labels
+    x = model.get_embedding([txt] * 10)
+    len(x)
 
-    s.explain('Es geht um eine grosse Familie.',
-              label='FAMILY',
-              n_max=None,
-              test_size=0.3,
-              use_cache=True)
+    model.predict(txt)
+    model.predict(txt, use_cache=False)
+    #model.predict([txt, txt], use_cache=True)
 
-    s.explain('Es geht um eine grosse Familie.',
-              label='FAMILY',
-              n_max=None,
-              test_size=None,
-              use_cache=True)
+    model.labels
 
-    s.explain('Es geht um eine grosse Familie.',
-              label='FAMILY',
-              n_max=20,
-              test_size=0.1,
-              use_cache=True)
+    model.explain(txt,
+                  label='FAMILY',
+                  n_max=None,
+                  test_size=0.3,
+                  use_cache=True)
 
-    s.save()
+    model.explain(txt,
+                  label='FAMILY',
+                  n_max=None,
+                  test_size=None,
+                  use_cache=True)
 
-    s.save(epoch=2)
+    model.explain(txt, label='FAMILY', n_max=20, test_size=0.1, use_cache=True)
+
+    model.explain(txt, label='FAMILY')
+
+    model.explain(txt, label='EMPLOYMENT')
+
+    model.save()
+
+    model.save(epoch=2)
