@@ -1,0 +1,217 @@
+<html>
+
+<head>
+  <title>Autopilot</title>
+
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/materialize/1.0.0/css/materialize.min.css">
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+
+  <link rel="preconnect" href="https://fonts.gstatic.com">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300&display=swap" rel="stylesheet">
+
+  <style>
+    body {
+      background: linear-gradient(0deg, rgba(224, 224, 224, 0.7) 0%, rgba(255, 255, 255, 1) 100%);
+    }
+
+    #status {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-family: Arial, Helvetica, sans-serif;
+      font-size: 14px;
+    }
+
+    #sentence {
+      font-size: 42px;
+      text-align: center;
+      cursor: default;
+      margin: 0;
+      position: absolute;
+      top: 45%;
+      left: 50%;
+      transform: translate(-50%, -45%);
+      width: 80%;
+    }
+
+    #buttons {
+      position: absolute;
+      bottom: 0;
+      width: 100%;
+      display: grid;
+      grid-gap: 0px;
+      grid-auto-flow: column;
+      grid-auto-rows: 120px;
+    }
+
+    #buttons a {
+      height: 120px;
+      text-align: center;
+      line-height: 120px;
+      box-shadow: none;
+      font-size: 22px;
+      font-weight: bold;
+      border-radius: 0px;
+    }
+
+    #buttons a:hover {
+      opacity: 0.8;
+    }
+
+    .btn-large i {
+      width: 20px;
+      font-size: 120px;
+      font-weight: bold;
+      opacity: 0.1;
+      margin-right: 80px;
+    }
+
+    #button_skip,
+    #button_neutral {
+      color: black;
+    }
+  </style>
+
+  <script type="text/javascript" src="static/socket.io.js"></script>
+
+  <script type="text/javascript">
+    function dom_ready(fn) {
+      if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        setTimeout(fn, 1);
+      } else {
+        document.addEventListener('DOMContentLoaded', fn);
+      }
+    }
+
+
+    function generate(num_requests) {
+      console.log('generate(num_requests=' + num_requests + ')')
+      window.socket.emit('generate', num_requests);
+    }
+
+    function annotate(labels) {
+      console.log('annotate (' + labels + ')');
+
+      if (window.is_waiting == false) {
+        let sentence = document.getElementById('sentence').innerHTML;
+        let data = { 'sentence': sentence, 'labels': labels };
+
+        window.socket.emit('annotate', data);
+
+        render_sentence();
+      }
+    }
+
+    function render_sentence() {
+
+      let message = '';
+      if (window.sentences.length == 0) {
+        message = 'Please wait...';
+        window.is_waiting = true;
+      } else {
+        shuffle(window.sentences);
+        message = window.sentences.shift();
+      }
+      document.getElementById('sentence').innerHTML = message;
+    }
+
+    function shuffle(array) {
+      for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+      }
+    }
+
+    dom_ready(function () {
+      console.log('DOM ready.');
+
+      namespace = '/test';
+
+      window.socket = io.connect(location.protocol + '//' + document.domain + ':' + location.port + namespace);
+
+      window.socket.on('connect', function () {
+        document.getElementById('status').innerHTML = 'Connected';
+      });
+
+      window.socket.on('progress', function (msg) {
+        console.log(msg);
+        document.getElementById('progress').innerHTML = msg;
+      });
+
+      window.socket.on('sentence', function (sentence) {
+        console.log('Received sentence: "' + sentence + '"');
+
+        window.sentences.push(sentence);
+
+        if (window.is_waiting) {
+          window.is_waiting = false;
+          render_sentence();
+        }
+      });
+
+      window.sentences = [];
+      window.buffer = 8;
+      window.requested = 0;
+      window.is_waiting = true;
+
+      generate(window.buffer - window.requested);
+      window.requested = window.buffer;
+
+      document.onkeydown = function (e) {
+        switch (e.keyCode) {
+          case 37:
+            // console.log('left');
+            annotate('SUSTAINABLE');
+            break;
+          case 38:
+            // console.log('up');
+            break;
+          case 39:
+            // console.log('right');
+            annotate('NEUTRAL');
+            break;
+          case 40:
+            // console.log('down');
+            annotate('SKIP')
+            break;
+        }
+      };
+
+    });
+  </script>
+</head>
+
+<body>
+  <button onclick="window.socket.emit('analyze', Math.random());">Analyze</button>
+
+  <div id="output">output</div>
+  <div id="progress">progress</div>
+  <div id="log">log</div>
+
+  <div id="status">Disconnected</div>
+
+  <div id="sentence">
+    Please wait...
+  </div>
+
+  <div id="buttons">
+    <a id="button_sustainable" class="waves-effect waves-light btn-large green darken-1"
+      onclick="annotate('SUSTAINABLE')">
+      SUSTAINABLE
+      <i class="material-icons right">arrow_backward</i>
+    </a>
+    <a id="button_skip" class="waves-effect waves-light btn-large grey lighten-5
+      " onclick="annotate('SKIP')">
+      Skip
+      <i class="material-icons right">arrow_downward</i>
+    </a>
+    <a id="button_neutral" class="waves-effect waves-light btn-large grey lighten-2
+    " onclick="annotate('NEUTRAL')">
+      NEUTRAL
+      <i class="material-icons right">arrow_forward</i>
+    </a>
+  </div>
+
+</body>
+
+</html>
